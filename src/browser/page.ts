@@ -10,7 +10,7 @@
  */
 
 import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions } from '../types.js';
-import { sendCommand, sendCommandFull } from './daemon-client.js';
+import { sendCommand, sendCommandFull, subscribeToPushEvents } from './daemon-client.js';
 import { buildEvaluateExpression } from './utils.js';
 import { saveBase64ToFile } from '../utils.js';
 import { generateStealthJs } from './stealth.js';
@@ -339,6 +339,56 @@ export class Page extends BasePage {
       cdpParams: params,
       ...this._cmdOpts(),
     });
+  }
+
+  // ─── Push bindings (Runtime.addBinding) ───────────────────────────
+  private _pushSubscription: { unsubscribe: () => void } | null = null;
+  private _pushCallbacks = new Map<string, Set<(payload: string) => void>>();
+
+  async addBinding(name: string): Promise<any> {
+    return await sendCommand('add-binding', { bindingName: name, ...this._cmdOpts() });
+  }
+
+  async removeBinding(name: string): Promise<void> {
+    this._pushCallbacks.delete(name);
+    if (this._pushCallbacks.size === 0 && this._pushSubscription) {
+      this._pushSubscription.unsubscribe();
+      this._pushSubscription = null;
+    }
+    await sendCommand('remove-binding', { bindingName: name, ...this._cmdOpts() });
+  }
+
+  onPushEvent(name: string, callback: (payload: string) => void): () => void {
+    let cbs = this._pushCallbacks.get(name);
+    if (!cbs) {
+      cbs = new Set();
+      this._pushCallbacks.set(name, cbs);
+    }
+    cbs.add(callback);
+
+    if (!this._pushSubscription) {
+      this._pushSubscription = subscribeToPushEvents({
+        filter: undefined,
+        contextId: this.contextId,
+        onEvent: (event) => {
+          const handlers = this._pushCallbacks.get(event.name);
+          if (handlers) {
+            for (const h of handlers) {
+              try { h(event.payload); } catch { /* callback error */ }
+            }
+          }
+        },
+      });
+    }
+
+    return () => {
+      cbs!.delete(callback);
+      if (cbs!.size === 0) this._pushCallbacks.delete(name);
+      if (this._pushCallbacks.size === 0 && this._pushSubscription) {
+        this._pushSubscription.unsubscribe();
+        this._pushSubscription = null;
+      }
+    };
   }
 
   async handleJavaScriptDialog(accept: boolean, promptText?: string): Promise<void> {

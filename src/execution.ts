@@ -324,13 +324,18 @@ export async function executeCommand(
           }
         }
         try {
+          // userTimeoutSec === 0 means "no ceiling" — used by long-running
+          // commands like message-listen that must run indefinitely.
           const browserTimeout = userTimeoutSec !== null
-            ? userTimeoutSec + RUNTIME_TIMEOUT_PADDING_SECONDS
+            ? (userTimeoutSec === 0 ? 0 : userTimeoutSec + RUNTIME_TIMEOUT_PADDING_SECONDS)
             : DEFAULT_BROWSER_COMMAND_TIMEOUT;
-          const result = await runWithTimeout(runCommand(cmd, page, kwargs, debug), {
-            timeout: browserTimeout,
-            label: fullName(cmd),
-          });
+          const commandPromise = runCommand(cmd, page, kwargs, debug);
+          const result = browserTimeout === 0
+            ? await commandPromise
+            : await runWithTimeout(commandPromise, {
+                timeout: browserTimeout,
+                label: fullName(cmd),
+              });
           observation?.record({
             stream: 'action',
             name: 'command',
@@ -375,7 +380,7 @@ export async function executeCommand(
       // a `--timeout` arg (and the resolved value is positive). Without that
       // arg there is no meaningful default — non-browser cmds are diverse
       // enough that a hard cap would do more harm than good.
-      if (userTimeoutSec !== null) {
+      if (userTimeoutSec !== null && userTimeoutSec > 0) {
         const ceiling = userTimeoutSec + RUNTIME_TIMEOUT_PADDING_SECONDS;
         result = await runWithTimeout(runCommand(cmd, null, kwargs, debug), {
           timeout: ceiling,
@@ -383,6 +388,7 @@ export async function executeCommand(
           hint: `Pass a higher --timeout value (currently ${userTimeoutSec}s)`,
         });
       } else {
+        // userTimeoutSec === 0 (explicit no-ceiling) or null (no --timeout arg)
         result = await runCommand(cmd, null, kwargs, debug);
       }
     }
@@ -543,11 +549,11 @@ function readUserTimeoutSeconds(cmd: CliCommand, kwargs: CommandArgs): number | 
   if (!cmd.args.some(a => a.name === 'timeout')) return null;
   const raw = kwargs.timeout;
   if (raw === undefined || raw === null || raw === '') {
-    throw new ArgumentError(`Argument "timeout" must be a positive integer. Received: "${String(raw)}"`);
+    throw new ArgumentError(`Argument "timeout" must be a non-negative integer (0 = no timeout). Received: "${String(raw)}"`);
   }
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new ArgumentError(`Argument "timeout" must be a positive integer. Received: "${String(raw)}"`);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new ArgumentError(`Argument "timeout" must be a non-negative integer (0 = no timeout). Received: "${String(raw)}"`);
   }
   return parsed;
 }

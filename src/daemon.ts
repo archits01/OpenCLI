@@ -61,6 +61,15 @@ interface LogEntry { level: string; msg: string; ts: number; }
 const LOG_BUFFER_SIZE = 200;
 const logBuffer: LogEntry[] = [];
 
+// ─── SSE push event subscribers ─────────────────────────────────────
+type PushSubscriber = {
+  res: ServerResponse;
+  contextId?: string;
+  filter?: string;
+  heartbeat: ReturnType<typeof setInterval>;
+};
+const pushSubscribers = new Set<PushSubscriber>();
+
 class DaemonCommandFailure extends Error {
   constructor(
     message: string,
@@ -283,6 +292,28 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  if (req.method === 'GET' && pathname === '/events') {
+    const params = new URL(url, `http://localhost:${PORT}`).searchParams;
+    const filter = params.get('filter') || undefined;
+    const contextId = params.get('contextId') || undefined;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write('event: connected\ndata: {}\n\n');
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch { /* gone */ }
+    }, 15000);
+    const sub: PushSubscriber = { res, contextId, filter, heartbeat };
+    pushSubscribers.add(sub);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      pushSubscribers.delete(sub);
+    });
+    return;
+  }
+
   if (req.method === 'POST' && pathname === '/shutdown') {
     jsonResponse(res, 200, { ok: true, message: 'Shutting down' });
     setTimeout(() => shutdown(), 100);
@@ -426,6 +457,26 @@ wss.on('connection', (ws: WebSocket) => {
         return;
       }
 
+      // Handle push events from extension (CDP network capture / Runtime.bindingCalled)
+      if (msg.type === 'push-event') {
+        // Resolve the source profile so we only forward to subscribers watching
+        // that profile (prevents cross-profile event bleed when multiple
+        // extensions are connected).
+        let sourceContextId: string | undefined;
+        for (const [ctxId, conn] of extensionProfiles.entries()) {
+          if (conn.ws === ws) { sourceContextId = ctxId; break; }
+        }
+        const data = JSON.stringify({ name: msg.name, payload: msg.payload, tabId: msg.tabId, ts: msg.ts, contextId: sourceContextId });
+        for (const sub of pushSubscribers) {
+          if (sub.filter && msg.name !== sub.filter) continue;
+          if (sub.contextId && sourceContextId && sub.contextId !== sourceContextId) continue;
+          try {
+            sub.res.write(`event: push\ndata: ${data}\n\n`);
+          } catch { /* subscriber gone */ }
+        }
+        return;
+      }
+
       // Handle log messages from extension
       if (msg.type === 'log') {
         if (msg.level === 'error') log.error(`[ext] ${msg.msg}`);
@@ -482,6 +533,11 @@ function shutdown(): void {
     p.reject(new Error('Daemon shutting down'));
   }
   pending.clear();
+  for (const sub of pushSubscribers) {
+    clearInterval(sub.heartbeat);
+    try { sub.res.end(); } catch { /* ignore */ }
+  }
+  pushSubscribers.clear();
   for (const profile of extensionProfiles.values()) profile.ws.close();
   httpServer.close();
   process.exit(EXIT_CODES.SUCCESS);

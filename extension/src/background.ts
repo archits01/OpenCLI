@@ -7,7 +7,7 @@
 
 declare const __OPENCLI_COMPAT_RANGE__: string;
 
-import type { Command, Result } from './protocol';
+import type { Command, Result, PushEventMessage } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL, WS_RECONNECT_BASE_DELAY, WS_RECONNECT_MAX_DELAY } from './protocol';
 import * as executor from './cdp';
 import * as identity from './identity';
@@ -1043,6 +1043,14 @@ function initialize(): void {
   chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24 seconds
   executor.registerListeners();
   try {
+    executor.setPushEventCallback((tabId: number, name: string, payload: string) => {
+      const msg: PushEventMessage = { type: 'push-event', tabId, name, payload, ts: Date.now() };
+      safeSend(ws, msg);
+    });
+  } catch {
+    // Tests may mock cdp without setPushEventCallback
+  }
+  try {
     const registerFrameTracking = (executor as { registerFrameTracking?: () => void }).registerFrameTracking;
     registerFrameTracking?.();
   } catch {
@@ -1165,6 +1173,10 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleWaitDownload(cmd);
       case 'frames':
         return await handleFrames(cmd, leaseKey);
+      case 'add-binding':
+        return await handleAddBinding(cmd, leaseKey);
+      case 'remove-binding':
+        return await handleRemoveBinding(cmd, leaseKey);
       default:
         return { id: cmd.id, ok: false, error: `Unknown action: ${cmd.action}` };
     }
@@ -1802,6 +1814,50 @@ async function handleInsertText(cmd: Command, leaseKey: string): Promise<Result>
   try {
     await executor.insertText(tabId, cmd.text);
     return pageScopedResult(cmd.id, tabId, { inserted: true });
+  } catch (err) {
+    return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function handleAddBinding(cmd: Command, leaseKey: string): Promise<Result> {
+  if (!cmd.bindingName) return { id: cmd.id, ok: false, error: 'Missing bindingName' };
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    // The reserved network-push binding pushes CDP-captured network entries
+    // directly — no page-JS Runtime.addBinding needed (LinkedIn defeats fetch
+    // interception, but CDP capture is reliable).
+    if (cmd.bindingName === executor.NETWORK_PUSH_BINDING) {
+      executor.enableNetworkPush(tabId);
+    } else if (cmd.bindingName === '__oc_recon_targets') {
+      const targets = await executor.enumerateTargets(tabId);
+      return pageScopedResult(cmd.id, tabId, { targets });
+    } else if (cmd.bindingName === '__oc_force_reconnect') {
+      const r = await executor.forceRealtimeReconnect(tabId);
+      return pageScopedResult(cmd.id, tabId, r);
+    } else if (cmd.bindingName === '__oc_ensure_online') {
+      await executor.ensureOnline(tabId);
+      return pageScopedResult(cmd.id, tabId, { online: true });
+    } else {
+      await executor.addBinding(tabId, cmd.bindingName);
+    }
+    return pageScopedResult(cmd.id, tabId, { bound: true, name: cmd.bindingName });
+  } catch (err) {
+    return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function handleRemoveBinding(cmd: Command, leaseKey: string): Promise<Result> {
+  if (!cmd.bindingName) return { id: cmd.id, ok: false, error: 'Missing bindingName' };
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    if (cmd.bindingName === executor.NETWORK_PUSH_BINDING) {
+      executor.disableNetworkPush(tabId);
+    } else {
+      await executor.removeBinding(tabId, cmd.bindingName);
+    }
+    return pageScopedResult(cmd.id, tabId, { removed: true, name: cmd.bindingName });
   } catch (err) {
     return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
   }

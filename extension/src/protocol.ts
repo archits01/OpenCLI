@@ -20,7 +20,9 @@ export type Action =
   | 'network-capture-read'
   | 'wait-download'
   | 'cdp'
-  | 'frames';
+  | 'frames'
+  | 'add-binding'
+  | 'remove-binding';
 
 export interface Command {
   /** Unique request ID */
@@ -77,6 +79,8 @@ export interface Command {
   frameIndex?: number;
   /** Browser profile/context selected by the CLI. Used by the daemon for routing. */
   contextId?: string;
+  /** Binding name for add-binding / remove-binding actions */
+  bindingName?: string;
 }
 
 export interface Result {
@@ -94,6 +98,14 @@ export interface Result {
   errorHint?: string;
   /** Page identity (targetId) — present only on page-scoped command responses */
   page?: string;
+}
+
+export interface PushEventMessage {
+  type: 'push-event';
+  tabId: number;
+  name: string;
+  payload: string;
+  ts: number;
 }
 
 /** Default daemon port */

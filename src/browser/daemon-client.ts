@@ -21,7 +21,7 @@ function generateId(): string {
 
 export interface DaemonCommand {
   id: string;
-  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames';
+  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'add-binding' | 'remove-binding';
   /** Target page identity (targetId). Cross-layer contract with the extension. */
   page?: string;
   code?: string;
@@ -61,6 +61,8 @@ export interface DaemonCommand {
   frameIndex?: number;
   /** Browser profile/context to route the command to. */
   contextId?: string;
+  /** Binding name for add-binding / remove-binding actions */
+  bindingName?: string;
 }
 
 export interface DaemonResult {
@@ -253,4 +255,56 @@ export async function sendCommandFull(
 
 export async function bindTab(session: string, opts: { contextId?: string } = {}): Promise<unknown> {
   return sendCommand('bind', { session, surface: 'browser', ...opts });
+}
+
+export interface PushEventSubscription {
+  unsubscribe: () => void;
+}
+
+export function subscribeToPushEvents(opts: {
+  filter?: string;
+  contextId?: string;
+  onEvent: (event: { name: string; payload: string; tabId: number; ts: number }) => void;
+}): PushEventSubscription {
+  const controller = new AbortController();
+  const params = new URLSearchParams();
+  if (opts.filter) params.set('filter', opts.filter);
+  if (opts.contextId) params.set('contextId', opts.contextId);
+  const url = `${DAEMON_URL}/events?${params.toString()}`;
+
+  (async () => {
+    try {
+      const res = await fetch(url, {
+        headers: { ...OPENCLI_HEADERS },
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) return;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (!controller.signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        let nextData: string | null = null;
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            nextData = line.slice(6);
+          } else if (line === '' && nextData !== null) {
+            try {
+              opts.onEvent(JSON.parse(nextData));
+            } catch { /* malformed */ }
+            nextData = null;
+          }
+        }
+      }
+    } catch {
+      // Aborted or network error — subscriber is done
+    }
+  })();
+
+  return { unsubscribe: () => controller.abort() };
 }

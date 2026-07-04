@@ -8,10 +8,74 @@
 
 const attached = new Set<number>();
 
+// ─── Push bindings (Runtime.addBinding) ─────────────────────────────
+const activeBindings = new Map<number, Set<string>>();
+let _pushEventCallback: ((tabId: number, name: string, payload: string) => void) | null = null;
+
+export function setPushEventCallback(cb: ((tabId: number, name: string, payload: string) => void) | null): void {
+  _pushEventCallback = cb;
+}
+
+// ─── CDP network-capture push ───────────────────────────────────────
+// Instead of relying on page-JS fetch interception (which LinkedIn defeats by
+// grabbing a fetch reference before our patch runs), we push CDP-captured
+// network entries directly from the debugger event handler. This is the same
+// reliable source the poll loop drains — just delivered instantly.
+export const NETWORK_PUSH_BINDING = '__oc_netcapture_push';
+const networkPushTabs = new Set<number>();
+// Only push messaging/realtime-relevant entries — avoids flooding the pipe with
+// every image/tracking request when the capture pattern is '' (capture-all).
+const NETWORK_PUSH_URL_RE = /deliveryAck|deliveryAcknowledgement|messaging|realtime|messenger|mercury|voyagerMessaging/i;
+
+export function enableNetworkPush(tabId: number): void {
+  networkPushTabs.add(tabId);
+}
+
+export function disableNetworkPush(tabId: number): void {
+  networkPushTabs.delete(tabId);
+}
+
+function maybePushNetworkEntry(tabId: number, entry: NetworkCaptureEntry): void {
+  if (!networkPushTabs.has(tabId) || !_pushEventCallback) return;
+  const url = entry.url || '';
+  // WebSocket frames always pass — a realtime WS URL may not match the HTTP regex.
+  const isWs = (entry.method || '').startsWith('WS_');
+  if (!isWs && !NETWORK_PUSH_URL_RE.test(url)) return;
+  try {
+    _pushEventCallback(tabId, NETWORK_PUSH_BINDING, JSON.stringify(entry));
+  } catch { /* serialization or callback failure — non-fatal */ }
+}
+
+// ─── Streaming body capture (Network.streamResourceContent) ──────────
+// A long-lived realtime connection never hits loadingFinished, so
+// getResponseBody can't read it. Arming streamResourceContent makes
+// dataReceived carry the actual bytes, so we can read in-flight frames.
+const streamArmedRequests = new Set<string>();
+// How many decoded chars of each streaming response we've already emitted, so
+// re-polling streamResourceContent yields only the new delta.
+const streamConsumedLen = new Map<string, number>();
+const wsUrlByRequestId = new Map<string, string>();
+const STREAM_CAPTURE_URL_RE = /realtime|voyagerMessagingGraphQL|messengerConversations|messengerMessages|mercury|subscribe/i;
+
+function decodeBase64Utf8(b64: string): string {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
 const tabFrameContexts = new Map<number, Map<string, number>>();
 const frameTargets = new Map<string, string>();
 const frameTargetKeys = new Map<string, string>();
 let frameTargetCleanupRegistered = false;
+
+// SharedWorker/Worker target tracking for network capture.
+// Maps worker targetId → the tabId whose network capture should receive the events.
+const workerTargetToTab = new Map<string, number>();
 
 // Large cap so agents stop hitting silent JSON.parse failures on real API bodies.
 // See src/browser/cdp.ts CDP_RESPONSE_BODY_CAPTURE_LIMIT for the matching constant
@@ -663,6 +727,126 @@ export async function startNetworkCapture(
     entries: [],
     requestToIndex: new Map(),
   });
+  // Discover and attach to SharedWorker/Worker targets for realtime capture.
+  // Workers maintain their own network connections (WebSocket, fetch) invisible
+  // to the parent tab's Network domain.
+  await attachWorkerTargets(tabId);
+}
+
+async function attachWorkerTargets(tabId: number): Promise<void> {
+  // chrome.debugger.getTargets() (extension API) sees browser-level targets —
+  // including SharedWorkers — that tab-scoped CDP Target.getTargets misses.
+  // LinkedIn's realtime connection lives in a SharedWorker, so this is the only
+  // way to reach it.
+  try {
+    const all = await new Promise<chrome.debugger.TargetInfo[]>((resolve) => {
+      chrome.debugger.getTargets((targets) => resolve(targets || []));
+    });
+    for (const target of all) {
+      const ttype = target.type || '';
+      const url = target.url || '';
+      // Attach to workers/service-workers on linkedin.com (the realtime host).
+      const isWorkerish = ttype === 'worker' || ttype === 'shared_worker' || ttype === 'service_worker' || ttype === 'other';
+      if (isWorkerish && /linkedin\.com/i.test(url) && target.id && !target.attached) {
+        await attachSingleWorkerTarget(tabId, target.id);
+      }
+    }
+  } catch {
+    // Worker discovery is best-effort
+  }
+}
+
+async function attachSingleWorkerTarget(tabId: number, targetId: string): Promise<void> {
+  if (workerTargetToTab.has(targetId)) return;
+  try {
+    await chrome.debugger.attach({ targetId } as chrome.debugger.Debuggee, '1.3');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('Another debugger is already attached')) return;
+    // Already attached is fine — we can still track it
+  }
+  workerTargetToTab.set(targetId, tabId);
+  try {
+    await chrome.debugger.sendCommand({ targetId } as chrome.debugger.Debuggee, 'Network.enable');
+  } catch { /* Worker may not support Network domain */ }
+}
+
+// ─── Realtime capture helpers (SharedWorker realtime channel) ────────
+
+/**
+ * Enumerate ALL inspectable targets via the chrome.debugger extension API.
+ * Unlike CDP Target.getTargets (tab-scoped), chrome.debugger.getTargets()
+ * returns browser-level targets too — including the SharedWorker that hosts
+ * LinkedIn's realtime connection, which is invisible to tab-scoped discovery.
+ */
+export async function enumerateTargets(tabId: number): Promise<Array<{ id?: string; type?: string; url?: string; title?: string; attached?: boolean; tabId?: number }>> {
+  try {
+    const all = await new Promise<chrome.debugger.TargetInfo[]>((resolve) => {
+      chrome.debugger.getTargets((targets) => resolve(targets || []));
+    });
+    return all.map((t) => ({ id: t.id, type: t.type, url: t.url, title: t.title, attached: t.attached, tabId: t.tabId }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Force LinkedIn's realtime connection to reconnect so we can capture it.
+ * The realtime stream lives in a SharedWorker and persists across page reloads,
+ * so it was established before our capture armed. Toggling offline/online on the
+ * tab AND every attached worker target drops that connection; when it reconnects
+ * under capture we see requestWillBeSent → responseReceived → arm streamResourceContent.
+ */
+export async function forceRealtimeReconnect(tabId: number): Promise<{ toggledTargets: number }> {
+  await ensureAttached(tabId);
+  // Make sure every worker is attached + Network-enabled before we toggle.
+  await attachWorkerTargets(tabId);
+
+  const debuggees: chrome.debugger.Debuggee[] = [{ tabId }];
+  for (const [targetId, owner] of workerTargetToTab.entries()) {
+    if (owner === tabId) debuggees.push({ targetId } as chrome.debugger.Debuggee);
+  }
+
+  const offline = { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 };
+
+  try {
+    for (const d of debuggees) {
+      try { await chrome.debugger.sendCommand(d, 'Network.emulateNetworkConditions', offline); } catch { /* target may not support */ }
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  } finally {
+    // ALWAYS restore online, even if the offline loop threw — never leave a tab
+    // stranded offline. Retried + clears any prior stuck emulation.
+    await restoreOnline(debuggees);
+  }
+  return { toggledTargets: debuggees.length };
+}
+
+/** Force targets back online (clears any stuck offline emulation). Idempotent. */
+async function restoreOnline(debuggees: chrome.debugger.Debuggee[]): Promise<void> {
+  const online = { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 };
+  for (const d of debuggees) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await chrome.debugger.sendCommand(d, 'Network.enable');
+        await chrome.debugger.sendCommand(d, 'Network.emulateNetworkConditions', online);
+        break;
+      } catch { await new Promise((r) => setTimeout(r, 150)); }
+    }
+  }
+}
+
+/**
+ * Clear any network emulation on a tab (and its workers) — the self-heal for a
+ * tab left offline by an interrupted forceRealtimeReconnect. Safe to call before
+ * navigation; CDP commands travel over the debugger, not the tab's network, so
+ * this works even when the tab is currently offline.
+ */
+export async function ensureOnline(tabId: number): Promise<void> {
+  try { await ensureAttached(tabId); } catch { return; }
+  // Tab-only — the offline emulation that breaks navigation lives on the tab.
+  // Iterating (possibly-stale) worker targets here can hang on dead debuggees.
+  await restoreOnline([{ tabId }]);
 }
 
 export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureEntry[]> {
@@ -689,11 +873,22 @@ function clearFrameTargetsForTab(tabId: number): void {
 
 export async function detach(tabId: number): Promise<void> {
   clearFrameTargetsForTab(tabId);
+  clearWorkerTargetsForTab(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   networkCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
+  activeBindings.delete(tabId);
+  networkPushTabs.delete(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
+}
+
+function clearWorkerTargetsForTab(tabId: number): void {
+  for (const [targetId, ownerTabId] of [...workerTargetToTab.entries()]) {
+    if (ownerTabId !== tabId) continue;
+    workerTargetToTab.delete(targetId);
+    chrome.debugger.detach({ targetId } as chrome.debugger.Debuggee).catch(() => {});
+  }
 }
 
 export function registerListeners(): void {
@@ -701,13 +896,18 @@ export function registerListeners(): void {
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
+    activeBindings.delete(tabId);
+    networkPushTabs.delete(tabId);
     clearFrameTargetsForTab(tabId);
+    clearWorkerTargetsForTab(tabId);
   });
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
+      activeBindings.delete(source.tabId);
+      networkPushTabs.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
     }
@@ -720,11 +920,20 @@ export function registerListeners(): void {
     }
   });
   chrome.debugger.onEvent.addListener(async (source, method, params) => {
-    const tabId = source.tabId;
+    // Resolve tabId: direct tab events have source.tabId; worker target events
+    // have source.targetId which we map back to the parent tab.
+    let tabId = source.tabId;
+    if (!tabId && source.targetId) {
+      tabId = workerTargetToTab.get(source.targetId);
+    }
     if (!tabId) return;
     const state = networkCaptures.get(tabId);
     if (!state) return;
     const eventParams = params as Record<string, any> | undefined;
+    // Use the correct debuggee for CDP commands: targetId for workers, tabId for tabs
+    const debuggee: chrome.debugger.Debuggee = source.targetId && workerTargetToTab.has(source.targetId)
+      ? { targetId: source.targetId }
+      : { tabId };
 
     if (method === 'Network.requestWillBeSent') {
       const requestId = String(eventParams?.requestId || '');
@@ -751,7 +960,7 @@ export function registerListeners(): void {
         entry.requestBodyTruncated = truncated;
       }
       try {
-        const postData = await chrome.debugger.sendCommand({ tabId }, 'Network.getRequestPostData', { requestId }) as { postData?: string };
+        const postData = await chrome.debugger.sendCommand(debuggee, 'Network.getRequestPostData', { requestId }) as { postData?: string };
         if (postData?.postData) {
           const raw = postData.postData;
           const fullSize = raw.length;
@@ -782,17 +991,46 @@ export function registerListeners(): void {
       entry.responseStatus = response?.status;
       entry.responseContentType = response?.mimeType || '';
       entry.responseHeaders = normalizeHeaders(response?.headers);
+
+      // Arm streaming capture for realtime connections so their in-flight
+      // bytes become readable via dataReceived. Only when push is active.
+      if (networkPushTabs.has(tabId) && STREAM_CAPTURE_URL_RE.test(entry.url || '') && !streamArmedRequests.has(requestId)) {
+        // Bound the set — realtime connections rotate, so armed IDs accumulate.
+        if (streamArmedRequests.size > 500) { streamArmedRequests.clear(); streamConsumedLen.clear(); }
+        streamArmedRequests.add(requestId);
+        try {
+          const buffered = await chrome.debugger.sendCommand(debuggee, 'Network.streamResourceContent', { requestId }) as { bufferedData?: string };
+          if (buffered?.bufferedData) {
+            const decoded = decodeBase64Utf8(buffered.bufferedData);
+            streamConsumedLen.set(requestId, decoded.length);
+            const bufEntry: NetworkCaptureEntry = {
+              kind: 'cdp',
+              url: entry.url,
+              method: 'STREAM_BUFFERED',
+              timestamp: Date.now(),
+              responsePreview: decoded,
+              responseContentType: entry.responseContentType,
+              responseHeaders: entry.responseHeaders,
+              responseBodyFullSize: buffered.bufferedData.length,
+            };
+            state.entries.push(bufEntry);
+            maybePushNetworkEntry(tabId, bufEntry);
+          }
+        } catch { /* streamResourceContent unsupported or request already done */ }
+      }
       return;
     }
 
     if (method === 'Network.loadingFinished') {
       const requestId = String(eventParams?.requestId || '');
+      streamArmedRequests.delete(requestId);
+      streamConsumedLen.delete(requestId);
       const stateEntryIndex = state.requestToIndex.get(requestId);
       if (stateEntryIndex === undefined) return;
       const entry = state.entries[stateEntryIndex];
       if (!entry) return;
       try {
-        const body = await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId }) as {
+        const body = await chrome.debugger.sendCommand(debuggee, 'Network.getResponseBody', { requestId }) as {
           body?: string;
           base64Encoded?: boolean;
         };
@@ -807,6 +1045,212 @@ export function registerListeners(): void {
       } catch {
         // Optional; bodies are unavailable for some requests (e.g. uploads).
       }
+      // Push the finalized entry (includes request body for delivery ACKs).
+      maybePushNetworkEntry(tabId, entry);
+      return;
+    }
+
+    // SSE (Server-Sent Events) — fires for each message on an open EventSource
+    // connection. This captures realtime streaming data (e.g. LinkedIn messaging)
+    // that Network.loadingFinished never sees because the connection stays open.
+    if (method === 'Network.eventSourceMessageReceived') {
+      const requestId = String(eventParams?.requestId || '');
+      const data = String(eventParams?.data || '');
+      if (!data) return;
+      const parentIndex = state.requestToIndex.get(requestId);
+      const parentEntry = parentIndex !== undefined ? state.entries[parentIndex] : undefined;
+      const url = parentEntry?.url || '';
+      if (!shouldCaptureUrl(url || 'eventSourceMessage', state.patterns)) return;
+      const fullSize = data.length;
+      const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
+      const sseEntry: NetworkCaptureEntry = {
+        kind: 'cdp',
+        url: url || `sse://${eventParams?.eventName || 'message'}`,
+        method: 'SSE',
+        timestamp: Date.now(),
+        responsePreview: truncated ? data.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : data,
+        responseBodyFullSize: fullSize,
+        responseBodyTruncated: truncated,
+      };
+      state.entries.push(sseEntry);
+      maybePushNetworkEntry(tabId, sseEntry);
+      return;
+    }
+
+    // Streaming data detection — fires for each chunk on any connection.
+    // For long-lived streaming requests, loadingFinished never fires.
+    // dataReceived lets us detect and read buffered data.
+    if (method === 'Network.dataReceived') {
+      const requestId = String(eventParams?.requestId || '');
+      const dataLength = Number(eventParams?.dataLength || 0);
+      if (!requestId || !dataLength) return;
+
+      const parentIndex = state.requestToIndex.get(requestId);
+      if (parentIndex === undefined) return;
+      const parentEntry = state.entries[parentIndex];
+      if (!parentEntry) return;
+
+      const url = parentEntry.url || '';
+      if (!STREAM_CAPTURE_URL_RE.test(url) && !/messaging|mercury/i.test(url)) return;
+      if (!shouldCaptureUrl(url, state.patterns)) return;
+
+      // Re-poll streamResourceContent on every dataReceived: it returns the full
+      // buffer received so far, so we diff against what we've already emitted and
+      // push only the new delta. This reliably reads long-lived SSE streams like
+      // /realtime/connect (whose inline dataReceived.data is unreliable) and any
+      // realtime connection whose responseReceived we missed. Enabling streaming
+      // is idempotent, so repeated calls are safe.
+      if (networkPushTabs.has(tabId) && STREAM_CAPTURE_URL_RE.test(url)) {
+        try {
+          const sc = await chrome.debugger.sendCommand(debuggee, 'Network.streamResourceContent', { requestId }) as { bufferedData?: string };
+          if (sc?.bufferedData) {
+            streamArmedRequests.add(requestId);
+            const full = decodeBase64Utf8(sc.bufferedData);
+            const consumed = streamConsumedLen.get(requestId) || 0;
+            if (full.length > consumed) {
+              const delta = full.slice(consumed);
+              streamConsumedLen.set(requestId, full.length);
+              const chunkEntry: NetworkCaptureEntry = {
+                kind: 'cdp', url, method: 'STREAM_CHUNK', timestamp: Date.now(),
+                responsePreview: delta,
+                responseContentType: parentEntry.responseContentType,
+                responseHeaders: parentEntry.responseHeaders,
+                responseBodyFullSize: delta.length,
+              };
+              state.entries.push(chunkEntry);
+              maybePushNetworkEntry(tabId, chunkEntry);
+            }
+          }
+        } catch { /* streamResourceContent unsupported or request finished */ }
+        return;
+      }
+
+      // Non-realtime streaming (e.g. long messaging fetch): fall back to inline
+      // data if present, else the debounced getResponseBody path below.
+      const inlineData = typeof eventParams?.data === 'string' ? eventParams.data : '';
+      if (inlineData) {
+        const decoded = decodeBase64Utf8(inlineData);
+        const chunkEntry: NetworkCaptureEntry = {
+          kind: 'cdp', url, method: 'STREAM_CHUNK', timestamp: Date.now(),
+          responsePreview: decoded,
+          responseContentType: parentEntry.responseContentType,
+          responseHeaders: parentEntry.responseHeaders,
+          responseBodyFullSize: inlineData.length,
+        };
+        state.entries.push(chunkEntry);
+        maybePushNetworkEntry(tabId, chunkEntry);
+        return;
+      }
+
+      // Debounce: only process once per second per request
+      const now = Date.now();
+      const lastSeen = (parentEntry as any)._lastDataReceived || 0;
+      if (now - lastSeen < 1000) return;
+      (parentEntry as any)._lastDataReceived = now;
+
+      // Try to read buffered response body (may fail for in-progress requests)
+      try {
+        const body = await chrome.debugger.sendCommand(debuggee, 'Network.getResponseBody', { requestId }) as {
+          body?: string;
+          base64Encoded?: boolean;
+        };
+        if (body?.body) {
+          const fullSize = body.body.length;
+          const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
+          const stored = truncated ? body.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : body.body;
+          const streamEntry: NetworkCaptureEntry = {
+            kind: 'cdp',
+            url,
+            method: 'STREAM',
+            timestamp: now,
+            responsePreview: body.base64Encoded ? `base64:${stored}` : stored,
+            responseBodyFullSize: fullSize,
+            responseBodyTruncated: truncated,
+          };
+          state.entries.push(streamEntry);
+          maybePushNetworkEntry(tabId, streamEntry);
+          return;
+        }
+      } catch { /* getResponseBody fails on in-progress requests */ }
+
+      const streamSignalEntry: NetworkCaptureEntry = {
+        kind: 'cdp',
+        url,
+        method: 'STREAM_SIGNAL',
+        timestamp: now,
+        responsePreview: `streaming:${dataLength}bytes`,
+      };
+      state.entries.push(streamSignalEntry);
+      maybePushNetworkEntry(tabId, streamSignalEntry);
+      return;
+    }
+
+    // WebSocket lifecycle — LinkedIn realtime may run over a WebSocket (often in
+    // a SharedWorker). Unlike HTTP streams, live frames fire even on a socket
+    // opened before capture, so this can tap an already-connected realtime WS.
+    if (method === 'Network.webSocketCreated') {
+      const wsUrl = String(eventParams?.url || '');
+      wsUrlByRequestId.set(String(eventParams?.requestId || ''), wsUrl);
+      const wsEntry: NetworkCaptureEntry = {
+        kind: 'cdp', url: wsUrl, method: 'WS_CREATED', timestamp: Date.now(),
+        responsePreview: '',
+      };
+      state.entries.push(wsEntry);
+      maybePushNetworkEntry(tabId, wsEntry);
+      return;
+    }
+    if (method === 'Network.webSocketFrameReceived' || method === 'Network.webSocketFrameSent') {
+      const reqId = String(eventParams?.requestId || '');
+      const wsUrl = wsUrlByRequestId.get(reqId) || `ws://${reqId}`;
+      const frame = eventParams?.response as { payloadData?: string; opcode?: number } | undefined;
+      const payload = String(frame?.payloadData || '');
+      if (!payload) return;
+      const wsEntry: NetworkCaptureEntry = {
+        kind: 'cdp',
+        url: wsUrl,
+        method: method === 'Network.webSocketFrameReceived' ? 'WS_RECV' : 'WS_SENT',
+        timestamp: Date.now(),
+        responsePreview: payload.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT),
+        responseBodyFullSize: payload.length,
+      };
+      state.entries.push(wsEntry);
+      maybePushNetworkEntry(tabId, wsEntry);
+      return;
+    }
+
+    // Push bindings: Runtime.bindingCalled fires when page JS calls a bound function
+    if (method === 'Runtime.bindingCalled') {
+      const name = String(eventParams?.name || '');
+      const payload = String(eventParams?.payload || '');
+      if (name && _pushEventCallback) {
+        const bindings = activeBindings.get(tabId);
+        if (bindings?.has(name)) {
+          _pushEventCallback(tabId, name, payload);
+        }
+      }
+      return;
     }
   });
+}
+
+export async function addBinding(tabId: number, name: string): Promise<void> {
+  await ensureAttached(tabId);
+  await chrome.debugger.sendCommand({ tabId }, 'Runtime.addBinding', { name });
+  let bindings = activeBindings.get(tabId);
+  if (!bindings) {
+    bindings = new Set();
+    activeBindings.set(tabId, bindings);
+  }
+  bindings.add(name);
+}
+
+export async function removeBinding(tabId: number, name: string): Promise<void> {
+  const bindings = activeBindings.get(tabId);
+  if (bindings) {
+    bindings.delete(name);
+    if (bindings.size === 0) activeBindings.delete(tabId);
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Runtime.removeBinding', { name });
+  } catch { /* binding may already be gone */ }
 }

@@ -152,4 +152,7 @@ export interface IPage {
   nativeType?(text: string): Promise<void>;
   /** Press a key via CDP Input.dispatchKeyEvent. */
   nativeKeyPress?(key: string, modifiers?: string[]): Promise<void>;
+  addBinding?(name: string): Promise<any>;
+  removeBinding?(name: string): Promise<void>;
+  onPushEvent?(name: string, callback: (payload: string) => void): () => void;
 }

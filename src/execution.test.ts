@@ -101,9 +101,12 @@ describe('executeCommand — non-browser timeout', () => {
       func: async () => [{ ok: true }],
     });
 
-    await expect(executeCommand(cmd, { timeout: 0 })).rejects.toBeInstanceOf(ArgumentError);
+    // Negative and non-integer values are still invalid.
     await expect(executeCommand(cmd, { timeout: -1 })).rejects.toBeInstanceOf(ArgumentError);
     await expect(executeCommand(cmd, { timeout: 1.5 })).rejects.toBeInstanceOf(ArgumentError);
+    // timeout: 0 is valid — it means "no ceiling" (used by long-running listeners).
+    await expect(executeCommand(cmd, { timeout: 0 })).resolves.toEqual([{ ok: true }]);
+    // Neither invalid values nor the no-ceiling path wrap the command in runWithTimeout.
     expect(runWithTimeoutSpy).not.toHaveBeenCalled();
     vi.restoreAllMocks();
   });
@@ -384,7 +387,7 @@ describe('executeCommand — non-browser timeout', () => {
       func: async () => [{ ok: true }],
     });
 
-    await expect(executeCommand(cmd, { timeout: 0 })).rejects.toBeInstanceOf(ArgumentError);
+    // Negative and non-integer values are still invalid; timeout: 0 now means "no ceiling".
     await expect(executeCommand(cmd, { timeout: -1 })).rejects.toBeInstanceOf(ArgumentError);
     await expect(executeCommand(cmd, { timeout: 1.5 })).rejects.toBeInstanceOf(ArgumentError);
     expect(runWithTimeoutSpy).not.toHaveBeenCalled();
@@ -408,7 +411,7 @@ describe('executeCommand — non-browser timeout', () => {
       func: async () => [{ ok: true }],
     });
 
-    await expect(executeCommand(cmd, { timeout: 0 })).rejects.toBeInstanceOf(ArgumentError);
+    await expect(executeCommand(cmd, { timeout: -1 })).rejects.toBeInstanceOf(ArgumentError);
     expect(browserSessionSpy).not.toHaveBeenCalled();
     vi.restoreAllMocks();
   });
