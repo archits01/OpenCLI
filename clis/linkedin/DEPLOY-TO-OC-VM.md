@@ -99,19 +99,31 @@ systemctl stop hermes-opencli-browser ; sleep 3
 pkill -9 -f 'load-extension=/root/.hermes/opencli-extension'   # ensure 0 chrome left
 ```
 
-## 4. Pre-existing blocker on the maya VM: no display on `:1`
+## 4. Display `:1` must exist (or the extension can't connect) — RESOLVED on maya
 
-`hermes-opencli-browser.service` uses `DISPLAY=:1`, but **`tigervncserver@:1` is
-disabled** and only `:0` (physical Xorg) exists. Chrome launches but can't
-render, so the **MV3 service worker never boots and the extension can't connect**
-— this fails identically with the *old* extension, i.e. the OpenCLI browser stack
-was never functional here (LinkedIn on these VMs runs via **Unipile**, not the
-browser). **Fix before testing:**
+`hermes-opencli-browser.service` uses `DISPLAY=:1`. If `:1` has no X server,
+Chrome launches but can't render → the **MV3 service worker never boots and the
+extension can't connect** (`Browser Bridge extension not connected`). This fails
+identically with the *old* extension, so it's a display problem, not the code.
+
+All the VMs use the same display: **Chrome on `:1` backed by Xtigervnc :1** (via
+the enabled `tigervncserver@:1.service`, auto-boot, persistent). The maya VM was
+the odd one out — `:1` wasn't running because **`/etc/tigervnc/vncserver.users`
+was missing the `:1=root` line** the others have (systemd's
+`tigervncsession-start` fails with *"No user configured for display :1"*). Fix
+(one line + enable, then it's persistent like LMI — no babysitting):
 ```bash
-systemctl start tigervncserver@:1     # brings up display :1
-# then re-run §3; the extension should connect
+echo ':1=root' >> /etc/tigervnc/vncserver.users      # the missing mapping
+systemctl enable --now tigervncserver@:1             # auto-boot + start
+systemctl is-active tigervncserver@:1                # active ; /tmp/.X1-lock appears
 ```
-(Check the other VMs for the same gap before blaming the extension.)
+Then §3 verifies green: `opencli browser … open` returns `{url,page}` and
+`/status` shows `extensionConnected: true`. (`:1` is a persistent service — leave
+it up; only Chrome is on-demand.)
+
+> Note: `startxfce4` in `~/.vnc/xstartup` also needs the tigervnc password file
+> (`~/.vnc/passwd`) present — maya already had one. On a truly fresh VM you'd
+> `vncpasswd` first (or copy the config from a working VM).
 
 ## 5. Rollback (full revert to stock npm)
 ```bash
