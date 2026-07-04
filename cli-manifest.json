@@ -19596,6 +19596,111 @@
   },
   {
     "site": "linkedin",
+    "name": "message-listen",
+    "description": "Listen for realtime LinkedIn messaging events (messages, typing, read receipts, presence) via network capture",
+    "access": "read",
+    "domain": "www.linkedin.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "duration",
+        "type": "int",
+        "default": 60,
+        "required": false,
+        "help": "Listen duration in seconds (0-86400, 0 = wait until a message arrives)"
+      },
+      {
+        "name": "timeout",
+        "type": "int",
+        "default": 0,
+        "required": false,
+        "help": "Maximum runtime in seconds (0 = no timeout, run forever)"
+      },
+      {
+        "name": "thread",
+        "type": "string",
+        "required": false,
+        "help": "Filter events to a specific thread ID"
+      },
+      {
+        "name": "type",
+        "type": "string",
+        "default": "all",
+        "required": false,
+        "help": "Event type filter: message, typing, seen, presence, or all",
+        "choices": [
+          "message",
+          "typing",
+          "seen",
+          "presence",
+          "all"
+        ]
+      },
+      {
+        "name": "include-self",
+        "type": "bool",
+        "default": false,
+        "required": false,
+        "help": "Include messages sent by you (excluded by default)"
+      },
+      {
+        "name": "stream",
+        "type": "bool",
+        "default": false,
+        "required": false,
+        "help": "Stream events as JSONL (one JSON object per line) instead of batch output"
+      }
+    ],
+    "columns": [
+      "event_type",
+      "thread_id",
+      "sender_urn",
+      "body",
+      "message_urn",
+      "timestamp",
+      "raw"
+    ],
+    "type": "js",
+    "modulePath": "linkedin/message-listen.js",
+    "sourceFile": "linkedin/message-listen.js",
+    "navigateBefore": "https://www.linkedin.com"
+  },
+  {
+    "site": "linkedin",
+    "name": "message-send",
+    "description": "Send a LinkedIn message via API (fast, no browser automation)",
+    "access": "write",
+    "domain": "www.linkedin.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "thread-id",
+        "type": "string",
+        "required": true,
+        "help": "Thread ID (e.g. 2-NWZk... or full thread URL)"
+      },
+      {
+        "name": "message",
+        "type": "string",
+        "required": true,
+        "help": "Message text to send"
+      }
+    ],
+    "columns": [
+      "ok",
+      "status",
+      "messageUrn",
+      "error"
+    ],
+    "type": "js",
+    "modulePath": "linkedin/message-listen.js",
+    "sourceFile": "linkedin/message-listen.js",
+    "navigateBefore": "https://www.linkedin.com"
+  },
+  {
+    "site": "linkedin",
     "name": "people-search",
     "description": "Search standard LinkedIn (not Sales Navigator) for people by keyword. Each invocation consumes against LinkedIn's monthly Commercial Use Limit on people search; throttle accordingly.",
     "access": "read",
