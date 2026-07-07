@@ -833,6 +833,28 @@ cli({
       } catch {}
     }
 
+    // Surface the logged-in account's own identity ("account_id equivalent") at
+    // startup = at login, so the managed service can tag the account. Enrich with
+    // public_identifier + name via an in-band /voyager/api/me fetch (best-effort;
+    // in-band avoids the cold-window race a separate whoami process would hit).
+    if (selfUrn || includeSelf) {
+      let pub = '', nm = '';
+      try {
+        const meRaw = unwrapEvaluateResult(await page.evaluate(String.raw`(async () => {
+          try {
+            const csrfM = document.cookie.match(/JSESSIONID="?([^";]+)/);
+            const r = await fetch('/voyager/api/me', { headers: { 'csrf-token': csrfM ? csrfM[1] : '', 'accept': 'application/json' }, credentials: 'include' });
+            return (await r.text()).slice(0, 30000);
+          } catch (e) { return ''; }
+        })()`));
+        pub = (String(meRaw).match(/"publicIdentifier":"([^"]+)"/) || [])[1] || '';
+        const fn = (String(meRaw).match(/"firstName":"([^"]+)"/) || [])[1] || '';
+        const ln = (String(meRaw).match(/"lastName":"([^"]+)"/) || [])[1] || '';
+        nm = normalizeWhitespace([fn, ln].filter(Boolean).join(' '));
+      } catch {}
+      process.stderr.write(`[self] member_id=${extractProfileId(selfUrn)} public_id=${pub} name=${JSON.stringify(nm)} urn=${selfUrn}\n`);
+    }
+
     // 2. Start CDP network capture
     if (page.startNetworkCapture) {
       const started = await page.startNetworkCapture(CAPTURE_PATTERN);
@@ -921,6 +943,41 @@ cli({
       return true;
     };
 
+    // In-band reconciliation. Re-fetch the recent conversation list and push any
+    // messages the realtime stream missed back through addEvent (which dedupes on
+    // seenUrns + applies the self-filter; the service dedupes again on message_urn).
+    // Triggered by a {"action":"backfill"} control command so reconciliation runs
+    // on the listener's OWN adapter tab — no separate `inbox` process, no window
+    // contention. This is the crash/gap-recovery safety net.
+    const runBackfill = async (count) => {
+      const convUrl = apiConfig.convFullUrl || '';
+      if (!convUrl || !apiConfig.csrf) { process.stderr.write('[backfill] skip: no convUrl/csrf\n'); return 0; }
+      const n = Math.max(1, Math.min(50, count || 20));
+      const safeConvUrl = JSON.stringify(convUrl);
+      const safeCsrf = JSON.stringify(apiConfig.csrf);
+      const script = `(async () => {
+        try {
+          var convUrl = ${safeConvUrl};
+          var modUrl = convUrl.replace(/,nextCursor:[^)]*/, '');
+          modUrl = modUrl.replace(/count:\\d+/, 'count:${n}');
+          if (modUrl.indexOf('_oc=1') === -1) modUrl += (modUrl.indexOf('?') >= 0 ? '&' : '?') + '_oc=1';
+          var resp = await fetch(modUrl, { credentials: 'include', headers: { 'csrf-token': ${safeCsrf}, 'accept': 'application/vnd.linkedin.normalized+json+2.1', 'x-restli-protocol-version': '2.0.0' } });
+          if (!resp.ok) return JSON.stringify({ _error: resp.status });
+          return await resp.text();
+        } catch (e) { return JSON.stringify({ _error: (e && e.message) || String(e) }); }
+      })()`;
+      let raw;
+      try { raw = unwrapEvaluateResult(await page.evaluate(script)); } catch { process.stderr.write('[backfill] eval failed\n'); return 0; }
+      if (!raw) return 0;
+      let probe; try { probe = JSON.parse(raw); } catch { probe = null; }
+      if (probe && probe._error) { process.stderr.write(`[backfill] _error=${JSON.stringify(probe._error)}\n`); return 0; }
+      const msgs = parseLinkedInOwnMessages(raw, 0);
+      let emitted = 0;
+      for (const m of msgs) { if (m.event_type !== 'message' || !m.body) continue; if (addEvent(m)) emitted++; }
+      process.stderr.write(`[backfill] fetched=${msgs.length} emitted=${emitted}\n`);
+      return emitted;
+    };
+
     // In stream mode, read stdin for send commands: {"action":"send","thread_id":"...","message":"..."}
     const stdinQueue = [];
     let stdinReader = null;
@@ -930,7 +987,7 @@ cli({
         rl.on('line', (line) => {
           try {
             const cmd = JSON.parse(line);
-            if (cmd && cmd.action === 'send' && cmd.message) stdinQueue.push(cmd);
+            if (cmd && (cmd.action === 'backfill' || (cmd.action === 'send' && cmd.message))) stdinQueue.push(cmd);
           } catch {}
         });
         rl.on('close', () => {});
@@ -952,7 +1009,7 @@ cli({
             if (!fs.existsSync(sendFile)) return;
             const lines = fs.readFileSync(sendFile, 'utf8').split('\n').filter(Boolean);
             for (let i = processedLines; i < lines.length; i++) {
-              try { const cmd = JSON.parse(lines[i]); if (cmd && cmd.action === 'send' && cmd.message) stdinQueue.push(cmd); } catch {}
+              try { const cmd = JSON.parse(lines[i]); if (cmd && (cmd.action === 'backfill' || (cmd.action === 'send' && cmd.message))) stdinQueue.push(cmd); } catch {}
             }
             processedLines = lines.length;
           } catch {}
@@ -1121,6 +1178,7 @@ cli({
       while (Date.now() < endTime) {
         while (stdinQueue.length > 0) {
           const cmd = stdinQueue.shift();
+          if (cmd.action === 'backfill') { await runBackfill(cmd.count || 20); continue; }
           const tid = cmd.thread_id || threadFilter || '';
           if (!tid || !cmd.message) {
             console.log(JSON.stringify({ event_type: 'send_error', error: 'missing thread_id or message' }));
@@ -1151,6 +1209,7 @@ cli({
       while (Date.now() < endTime) {
         while (stdinQueue.length > 0) {
           const cmd = stdinQueue.shift();
+          if (cmd.action === 'backfill') { await runBackfill(cmd.count || 20); continue; }
           const tid = cmd.thread_id || threadFilter || '';
           if (!tid || !cmd.message) {
             console.log(JSON.stringify({ event_type: 'send_error', error: 'missing thread_id or message' }));

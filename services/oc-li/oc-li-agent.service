@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenCLI LinkedIn managed engagement agent (oc-li)
+After=network-online.target hermes-opencli-browser.service opencli-daemon.service
+Wants=hermes-opencli-browser.service opencli-daemon.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/oc-li-service
+Environment=NODE_NO_WARNINGS=1
+ExecStart=/usr/bin/node /opt/oc-li-service/agent.mjs
+StandardInput=null
+StandardOutput=append:/opt/oc-li-service/agent.log
+StandardError=append:/opt/oc-li-service/agent.log
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=12
+
+[Install]
+WantedBy=multi-user.target

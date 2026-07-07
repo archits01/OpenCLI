@@ -1,0 +1,21 @@
+{
+  "_comment": "Per-VM oc-li deployment config. The account IDENTITY (member_id/vanity/name) is auto-derived at login via the listener's [self] emit — do NOT set it here. Only deploy POLICY lives here.",
+
+  "label": "clientname-production",
+
+  "reply_policy": "all_leads",
+  "_reply_policy_options": {
+    "allowlist": "only members in `allowlist` get a real reply — use for a real account you don't want fully auto-engaged, or for testing (start here on every new deploy)",
+    "all_leads": "reply to anyone the engine engages; the engine's CRM lead-lookup already gates (unknown senders → no reply). The normal production mode once the account is cleared."
+  },
+
+  "allowlist": ["ACoAA...test-target-member-id..."],
+
+  "engine": {
+    "cmd": "/usr/bin/python3",
+    "args": ["/root/oc_li_engage.py"]
+  },
+  "_engine_comment": "The existing reply engine glue on this VM (engagement.py + auto_reply via the OC router). Point at whatever engine this account uses; must read {member_id,chat_id,text} on stdin and print {reply,action} JSON.",
+
+  "listen_duration": 3600
+}
